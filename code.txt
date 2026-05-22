@@ -1,0 +1,191 @@
+#include <iostream>
+#include <vector>
+#include <immintrin.h>
+#include <complex>
+#include <chrono>
+#include <mkl.h>
+#include <thread>
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
+#include <ctime>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+using namespace std;
+using Complex = complex<float>;
+
+const int n = 4096;
+
+// 1. Вариант: Наивный алгоритм (Линейная алгебра)
+void multiply_naive(const vector<Complex>& A, const vector<Complex>& B, vector<Complex>& C) {
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            Complex sum(0, 0);
+            for (int k = 0; k < n; ++k) {
+                sum += A[i * n + k] * B[k * n + j];
+            }
+            C[i * n + j] = sum;
+        }
+    }
+}
+
+// 3. Вариант: Оптимизированный алгоритм (Блоки + SoA + AVX2 + std::thread)
+void multiply_optimized(const vector<Complex>& A, const vector<Complex>& B, vector<Complex>& C) {
+    vector<float> A_real(n * n), A_imag(n * n);
+    vector<float> B_real(n * n), B_imag(n * n);
+    vector<float> C_real(n * n, 0.0f), C_imag(n * n, 0.0f);
+
+    for (int i = 0; i < n * n; ++i) {
+        A_real[i] = A[i].real(); A_imag[i] = A[i].imag();
+        B_real[i] = B[i].real(); B_imag[i] = B[i].imag();
+    }
+
+    const int BLOCK_SIZE = 64;
+    unsigned int num_threads = thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+
+    vector<thread> threads;
+
+    auto worker = [&](int start_i, int end_i) {
+        for (int sj = 0; sj < n; sj += BLOCK_SIZE) {
+            for (int sk = 0; sk < n; sk += BLOCK_SIZE) {
+                for (int i = start_i; i < end_i; ++i) {
+                    float* c_re_ptr = &C_real[i * n];
+                    float* c_im_ptr = &C_imag[i * n];
+
+                    for (int j = sj; j < sj + BLOCK_SIZE; j += 8) {
+                        __m256 c_re_vec = _mm256_loadu_ps(&c_re_ptr[j]);
+                        __m256 c_im_vec = _mm256_loadu_ps(&c_im_ptr[j]);
+
+                        for (int k = sk; k < sk + BLOCK_SIZE; ++k) {
+                            __m256 a_re_vec = _mm256_set1_ps(A_real[i * n + k]);
+                            __m256 a_im_vec = _mm256_set1_ps(A_imag[i * n + k]);
+
+                            const float* b_re_ptr = &B_real[k * n];
+                            const float* b_im_ptr = &B_imag[k * n];
+
+                            __m256 b_re_vec = _mm256_loadu_ps(&b_re_ptr[j]);
+                            __m256 b_im_vec = _mm256_loadu_ps(&b_im_ptr[j]);
+
+                            __m256 re_part1 = _mm256_mul_ps(a_re_vec, b_re_vec);
+                            __m256 re_part2 = _mm256_mul_ps(a_im_vec, b_im_vec);
+                            c_re_vec = _mm256_add_ps(c_re_vec, _mm256_sub_ps(re_part1, re_part2));
+
+                            __m256 im_part1 = _mm256_mul_ps(a_re_vec, b_im_vec);
+                            __m256 im_part2 = _mm256_mul_ps(a_im_vec, b_re_vec);
+                            c_im_vec = _mm256_add_ps(c_im_vec, _mm256_add_ps(im_part1, im_part2));
+                        }
+
+                        _mm256_storeu_ps(&c_re_ptr[j], c_re_vec);
+                        _mm256_storeu_ps(&c_im_ptr[j], c_im_vec);
+                    }
+                }
+            }
+        }
+        };
+
+    int rows_per_thread = n / num_threads;
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        int start_i = t * rows_per_thread;
+        int end_i = (t == num_threads - 1) ? n : start_i + rows_per_thread;
+        threads.push_back(thread(worker, start_i, end_i));
+    }
+
+    for (auto& th : threads) {
+        if (th.joinable()) th.join();
+    }
+
+    for (int i = 0; i < n * n; ++i) {
+        C[i] = Complex(C_real[i], C_imag[i]);
+    }
+}
+
+// Вывод статистики в фиксированном формате чисел
+double print_stats(string name, double seconds) {
+    double c = 2.0 * n * n * n; // Оценка сложности по формуле лабы
+    double p = (c / seconds) * 1e-6; // MFlops
+    cout << name << ":\n";
+    cout << "  Время: " << seconds << " s\n";
+    cout << fixed << setprecision(2);
+    cout << "  Производительность: " << p << " MFlops\n";
+    cout << defaultfloat;
+    return p;
+}
+
+// Математически верный вывод комплексных чисел в формате: a + bia
+void print_matrix_sample(const vector<Complex>& M) {
+    cout << "  Фрагмент матрицы (3x3):\n";
+    cout << fixed << setprecision(2);
+
+    for (int i = 0; i < 3; ++i) {
+        cout << "    ";
+        for (int j = 0; j < 3; ++j) {
+            Complex val = M[i * n + j];
+            float re = val.real();
+            float im = val.imag();
+
+            string cell = to_string(re).substr(0, to_string(re).find('.') + 3);
+            if (im >= 0) {
+                cell += " + " + to_string(im).substr(0, to_string(im).find('.') + 3) + "i";
+            }
+            else {
+                cell += " - " + to_string(abs(im)).substr(0, to_string(abs(im)).find('.') + 3) + "i";
+            }
+
+            cout << setw(26) << left << cell << " ";
+        }
+        cout << "\n";
+    }
+    cout << "\n";
+    cout << defaultfloat;
+}
+
+int main() {
+#ifdef _WIN32
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+#endif
+
+    cout << "Кучугурный Денис Дмитриевич РПИб-о25" << "\n\n";
+
+    vector<Complex> A(n * n), B(n * n), C_naive(n * n), C_mkl(n * n), C_opt(n * n);
+
+    srand(static_cast<unsigned int>(time(nullptr)));
+    for (int i = 0; i < n * n; ++i) {
+        A[i] = { (float)rand() / RAND_MAX, (float)rand() / RAND_MAX };
+        B[i] = { (float)rand() / RAND_MAX, (float)rand() / RAND_MAX };
+    }
+
+    // 1. Вариант: Счёт в лоб
+    auto s1 = chrono::high_resolution_clock::now();
+    multiply_naive(A, B, C_naive);
+    auto e1 = chrono::high_resolution_clock::now();
+    print_stats("1-й вариант (по формуле из линейной алгебры)", chrono::duration<double>(e1 - s1).count());
+    print_matrix_sample(C_naive);
+
+    // 2. Вариант: Intel MKL (cblas_cgemm)
+    MKL_Complex8 alpha = { 1.0f, 0.0f }, beta = { 0.0f, 0.0f };
+    auto s2 = chrono::high_resolution_clock::now();
+    cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, &alpha, A.data(), n, B.data(), n, &beta, C_mkl.data(), n);
+    auto e2 = chrono::high_resolution_clock::now();
+    double mkl_perf = print_stats("2-й вариант (cblas_cgemm из Intel MKL):", chrono::duration<double>(e2 - s2).count());
+    print_matrix_sample(C_mkl);
+
+    // 3. Вариант: Оптимизированный AVX2 алгоритм
+    auto s3 = chrono::high_resolution_clock::now();
+    multiply_optimized(A, B, C_opt);
+    auto e3 = chrono::high_resolution_clock::now();
+    double opt_perf = print_stats("3-й вариант (Оптимизированный вариант):", chrono::duration<double>(e3 - s3).count());
+    print_matrix_sample(C_opt);
+
+    // Расчёт и вывод процентного соотношения
+    double percentage = (opt_perf / mkl_perf) * 100.0;
+    cout << fixed << setprecision(2);
+    cout << "Доля оптимизированного варианта от MKL: " << percentage << " процентов\n";
+    cout << defaultfloat;
+
+    return 0;
+}
